@@ -9,6 +9,11 @@ from pathlib import Path
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -101,10 +106,10 @@ class WorkloadGenerator:
                 namespace=namespace,
                 body=body,
             )
-            logger.info(f"Deleted job {namespace}/{job_name} from Kubernetes.")
+            logger.debug(f"Deleted job {namespace}/{job_name} from Kubernetes.")
         except ApiException as exc:
             if exc.status == 404:
-                logger.info(f"Job {namespace}/{job_name} was already deleted.")
+                logger.debug(f"Job {namespace}/{job_name} was already deleted.")
                 return
             raise
 
@@ -143,7 +148,7 @@ class WorkloadGenerator:
                         job_info["terminal_state"] = terminal_state
                         job_info["finished_at"] = completed_at.isoformat() if completed_at else None
                         job_info["to_be_deleted_at"] = delete_at.isoformat()
-                        logger.info(
+                        logger.debug(
                             f"Job {namespace}/{job_name} reached terminal state: {terminal_state}."
                             f" It will be deleted at {delete_at.isoformat()}."
                         )
