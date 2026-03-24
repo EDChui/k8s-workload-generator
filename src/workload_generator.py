@@ -1,12 +1,13 @@
 import re
-import logging
 import time
-from datetime import datetime, timezone
-from typing import Optional, List
+import yaml
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Tuple
 from pathlib import Path
 
-import yaml
 from kubernetes import client, config
+from kubernetes.client.rest import ApiException
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,10 @@ class WorkloadGenerator:
     def load_yaml(path: Path) -> dict:
         with path.open() as f:
             return yaml.safe_load(f)
+        
+    @staticmethod
+    def now_utc() -> datetime:
+        return datetime.now(timezone.utc)
     
     @staticmethod
     def now_utc_compact() -> str:
@@ -77,7 +82,86 @@ class WorkloadGenerator:
             result = self.launch_single_job(namespace, unique_job_name, run_id, node_name)
             results.append(result)
         return results
+    
+    def _get_job_terminal_state(self, job: client.V1Job) -> Tuple[Optional[str], Optional[datetime]]:
+        status = job.status
         
+        for condition in status.conditions or []:
+            if condition.type == "Complete" and condition.status == "True":
+                return "succeeded", condition.last_transition_time
+            if condition.type == "Failed" and condition.status == "True":
+                return "failed", condition.last_transition_time
+        return None, None
+    
+    def _delete_job(self, namespace: str, job_name: str) -> None:
+        body = client.V1DeleteOptions(propagation_policy="Background")
+        try:
+            self._batch_api.delete_namespaced_job(
+                name=job_name,
+                namespace=namespace,
+                body=body,
+            )
+            logger.info(f"Deleted job {namespace}/{job_name} from Kubernetes.")
+        except ApiException as exc:
+            if exc.status == 404:
+                logger.info(f"Job {namespace}/{job_name} was already deleted.")
+                return
+            raise
+
+    def wait_for_jobs_and_cleanup(
+        self,
+        launched_jobs: List[dict],
+        delete_after_seconds: int = 300,
+        status_poll_seconds: int = 10,
+    ) -> List[dict]:
+        tracked_jobs = {
+            (job["namespace"], job["job_name"]): dict(job) for job in launched_jobs
+        }
+        remaining_jobs = set(tracked_jobs.keys())
+
+        while remaining_jobs:
+            now = self.now_utc()
+
+            for namespace, job_name in list(remaining_jobs):
+                job_info = tracked_jobs[(namespace, job_name)]
+                try:
+                    current_job = self._batch_api.read_namespaced_job(name=job_name, namespace=namespace)
+                except ApiException as e:
+                    if e.status == 404:
+                        logger.debug(f"Job {namespace}/{job_name} not found (might have been deleted)")
+                        remaining_jobs.remove((namespace, job_name))
+                        job_info.setdefault("terminal_state", "deleted")
+                        continue
+                    else:
+                        logger.error(f"Error fetching job {namespace}/{job_name}: {e}")
+                        raise
+                
+                if job_info.get("terminal_state") is None:
+                    terminal_state, completed_at = self._get_job_terminal_state(current_job)
+                    if terminal_state:
+                        delete_at = (completed_at or now) + timedelta(seconds=delete_after_seconds)
+                        job_info["terminal_state"] = terminal_state
+                        job_info["finished_at"] = completed_at.isoformat() if completed_at else None
+                        job_info["to_be_deleted_at"] = delete_at.isoformat()
+                        logger.info(
+                            f"Job {namespace}/{job_name} reached terminal state: {terminal_state}."
+                            f" It will be deleted at {delete_at.isoformat()}."
+                        )
+                
+                to_delete_at_str = job_info.get("to_be_deleted_at")
+                if to_delete_at_str:
+                    delete_at = datetime.fromisoformat(to_delete_at_str)
+                    if now >= delete_at:
+                        self._delete_job(namespace, job_name)
+                        job_info.setdefault("terminal_state", "deleted")
+                        job_info["deleted_at"] = now.isoformat()
+                        remaining_jobs.remove((namespace, job_name))
+            
+            if remaining_jobs:
+                logger.info(f"Still tracking {len(remaining_jobs)} job(s). Polling again in {status_poll_seconds} seconds...")
+                time.sleep(status_poll_seconds)
+        return list(tracked_jobs.values())
+
     def run(self, namespace: str, job_name: str, run_id: str, total_tasks: int, batch_size: int, wait_seconds: int) -> List[dict]:
         launched_jobs = []
         tasks_launched = 0
