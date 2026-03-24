@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: PLACEHOLDER_JOB_NAME
+  namespace: default
+  labels:
+    app: fibonacci-benchmark
+    run_id: PLACEHOLDER_RUN_ID
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: fibonacci-benchmark
+        run_id: PLACEHOLDER_RUN_ID
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: main
+          image: python:3.11-slim
+          command: ["python", "-u", "-c"]
+          args:
+            - |
+              import sys
+              import time
+
+              def fib(n):
+                  if n <= 1:
+                      return n
+                  return fib(n-1) + fib(n-2)
+
+              # 37 = 30 seconds
+              # 40 = 120 seconds
+              # 42 = 300 seconds
+
+              MAX_N = 42
+
+              print(f"Starting slow Fibonacci calculation up to {MAX_N}", flush=True)
+
+              for i in range(MAX_N + 1):
+                  start = time.time()
+                  result = fib(i)
+                  elapsed = time.time() - start
+                  print(f"fib({i}) = {result} (computed in {elapsed:.3f}s)", flush=True)
+
+              print("Done", flush=True)
+          resources:
+            requests:
+              cpu: "0.5"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "256Mi"
