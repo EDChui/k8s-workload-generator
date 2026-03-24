@@ -7,7 +7,7 @@ from workload_generator import WorkloadGenerator
 @click.command(help="Launch multiple Kubernetes jobs in batches")
 @click.option("--template", required=True, help="Path to Job YAML template")
 @click.option("--namespace", default="default", required=True, help="Kubernetes namespace")
-@click.option("--job-name", default="demo",required=True, help="Base name for the jobs")
+@click.option("--job-name", default="demo", help="Base name for the jobs")
 @click.option("--run-id", default="0", help="Unique identifier for the run")
 @click.option("--total-tasks", default=20, required=True, type=int, help="Total number of tasks to launch")
 @click.option("--batch-size", default=5, required=True, type=int, help="Number of tasks to launch in each batch")
