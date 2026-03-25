@@ -3,7 +3,7 @@ import time
 import yaml
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set, Dict
 from pathlib import Path
 
 from kubernetes import client, config
@@ -166,18 +166,117 @@ class WorkloadGenerator:
                 logger.info(f"Still tracking {len(remaining_jobs)} job(s). Polling again in {status_poll_seconds} seconds...")
                 time.sleep(status_poll_seconds)
         return list(tracked_jobs.values())
+    
+    def _check_and_delete_jobs(
+        self,
+        tracked_jobs: Dict[Tuple[str, str], dict],
+        remaining_jobs: Set[Tuple[str, str]],
+        delete_after_seconds: int
+    ) -> None:
+        """Checks the status of tracked jobs and deletes those that have been in a terminal state for longer than the specified duration."""
+        now = self.now_utc()
+        for namespace, job_name in list(remaining_jobs):
+            job_info = tracked_jobs[(namespace, job_name)]
+            try:
+                current_job = self._batch_api.read_namespaced_job(name=job_name, namespace=namespace)
+            except ApiException as e:
+                if e.status == 404:
+                    logger.debug(f"Job {namespace}/{job_name} not found (might have been deleted)")
+                    remaining_jobs.remove((namespace, job_name))
+                    job_info.setdefault("terminal_state", "deleted")
+                    continue
+                else:
+                    logger.error(f"Error fetching job {namespace}/{job_name}: {e}")
+                    raise
+            
+            # Check if the job has reached a terminal state and update tracking info if we haven't already recorded it
+            if job_info.get("terminal_state") is None:
+                terminal_state, completed_at = self._get_job_terminal_state(current_job)
+                if terminal_state:
+                    delete_at = (completed_at or now) + timedelta(seconds=delete_after_seconds)
+                    job_info["terminal_state"] = terminal_state
+                    job_info["finished_at"] = completed_at.isoformat() if completed_at else None
+                    job_info["to_be_deleted_at"] = delete_at.isoformat()
+                    logger.debug(
+                        f"Job {namespace}/{job_name} reached terminal state: {terminal_state}."
+                        f" It will be deleted at {delete_at.isoformat()}."
+                    )
+            
+            # Check if it's time to delete the job
+            to_delete_at_str = job_info.get("to_be_deleted_at")
+            if to_delete_at_str:
+                delete_at = datetime.fromisoformat(to_delete_at_str)
+                if now >= delete_at:
+                    self._delete_job(namespace, job_name)
+                    job_info.setdefault("terminal_state", "deleted")
+                    job_info["deleted_at"] = now.isoformat()
+                    remaining_jobs.remove((namespace, job_name))
+    
+    def _wait_with_cleanup(
+        self,
+        tracked_jobs: Dict[Tuple[str, str], dict],
+        remaining_jobs: Set[Tuple[str, str]],
+        wait_seconds: int,
+        delete_after_seconds: int,
+        status_poll_seconds: int,
+    ) -> None:
+        """Waits for the specified duration while periodically checking the status of tracked jobs and deleting those that have been in a terminal state for longer than the specified duration."""
+        deadline = self.now_utc() + timedelta(seconds=wait_seconds)
 
-    def run(self, namespace: str, job_name: str, run_id: str, total_tasks: int, batch_size: int, wait_seconds: int) -> List[dict]:
-        launched_jobs = []
-        tasks_launched = 0
-        while tasks_launched < total_tasks:
-            current_batch_size = min(batch_size, total_tasks - tasks_launched)
+        while True:
+            self._check_and_delete_jobs(
+                tracked_jobs=tracked_jobs,
+                remaining_jobs=remaining_jobs,
+                delete_after_seconds=delete_after_seconds,
+            )
+
+            remaining_wait_seconds = max(0.0, (deadline - self.now_utc()).total_seconds())
+            if remaining_wait_seconds <= 0:
+                return
+
+            sleep_seconds = min(status_poll_seconds, remaining_wait_seconds)
+            logger.info(f"Still tracking {len(remaining_jobs)} job(s). Waiting {int(remaining_wait_seconds)} more second(s) before the next action...")
+            time.sleep(sleep_seconds)
+
+    def run(self, namespace: str, job_name: str, run_id: str, total_jobs: int, batch_size: int, wait_seconds: int, delete_after_seconds: int, status_poll_seconds: int) -> List[dict]:
+        tracked_jobs: Dict[Tuple[str, str], dict] = {}
+        remaining_jobs: Set[Tuple[str, str]] = set()
+        launched_count = 0
+
+        while launched_count < total_jobs:
+            current_batch_size = min(batch_size, total_jobs - launched_count)
             batch_jobs = self.launch_multiple_jobs(namespace, job_name, run_id, current_batch_size)
-            launched_jobs.extend(batch_jobs)
-            tasks_launched += current_batch_size
+            for job in batch_jobs:
+                job_key = (job["namespace"], job["job_name"])
+                tracked_jobs[job_key] = job
+                remaining_jobs.add(job_key)
+            launched_count += current_batch_size
 
-            if tasks_launched < total_tasks:
-                logger.info(f"Launched {tasks_launched}/{total_tasks} tasks. Waiting for {wait_seconds} seconds before next batch...")
-                time.sleep(wait_seconds)
-        logger.info(f"All {total_tasks} tasks launched.")
-        return launched_jobs
+            # After launching each batch, check the status of all tracked jobs and
+            # delete those that have been in a terminal state for longer than the specified duration before waiting for the next batch
+            self._check_and_delete_jobs(
+                tracked_jobs=tracked_jobs,
+                remaining_jobs=remaining_jobs,
+                delete_after_seconds=delete_after_seconds,
+            )
+
+            if launched_count < total_jobs:
+                logger.info(f"Launched {launched_count}/{total_jobs} jobs. Continuing cleanup polling while waiting {wait_seconds} seconds before launching next batch...")
+                self._wait_with_cleanup(
+                    tracked_jobs=tracked_jobs,
+                    remaining_jobs=remaining_jobs,
+                    wait_seconds=wait_seconds,
+                    delete_after_seconds=delete_after_seconds,
+                    status_poll_seconds=status_poll_seconds,
+                )
+        logger.info(f"All {total_jobs} jobs launched. Continuing cleanup until all tracked jobs are deleted...")
+        while remaining_jobs:
+            self._check_and_delete_jobs(
+                tracked_jobs=tracked_jobs,
+                remaining_jobs=remaining_jobs,
+                delete_after_seconds=delete_after_seconds,
+            )
+            if remaining_jobs:
+                logger.info(f"Still tracking {len(remaining_jobs)} job(s). Polling again in {status_poll_seconds} seconds...")
+                time.sleep(status_poll_seconds)
+        return list(tracked_jobs.values())
