@@ -7,9 +7,17 @@
 # Sample Usage
 
 ```bash
- python3 k8s-workload-generator/src/cli.py \
+ python3 k8s-workload-generator/src/cli.py batch \
     --template k8s-workload-generator/assets/fibonacci-template.yaml \
-    --namespace exp --job-name demo --run-id 0 \
+    --namespace exp --job-name demo \
     --total-jobs 20 --batch-size 5 --wait-seconds 30 \
+    --delete-after-seconds 30 --status-poll-seconds 30
+```
+
+```bash
+ python3 k8s-workload-generator/src/cli.py poisson \
+    --template k8s-workload-generator/assets/fibonacci-template.yaml \
+    --namespace exp --job-name demo \
+    --total-jobs 20 --iat-seconds 30 \
     --delete-after-seconds 30 --status-poll-seconds 30
 ```

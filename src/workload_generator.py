@@ -1,7 +1,8 @@
+import logging
+import random
 import re
 import time
 import yaml
-import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Tuple, Set, Dict
 from pathlib import Path
@@ -39,24 +40,20 @@ class WorkloadGenerator:
     @staticmethod
     def sanitize_k8s_name(name: str, max_length: int = 63) -> str:
         name = name.lower()
-        name = re.sub(r'[^a-z0-9.-]+', '-', name)   # replace invalid chars, including "_"
-        name = re.sub(r'^[^a-z0-9]+', '', name)     # must start with alnum
-        name = re.sub(r'[^a-z0-9]+$', '', name)     # must end with alnum
-        name = re.sub(r'-{2,}', '-', name)          # collapse repeated dashes
+        name = re.sub(r"[^a-z0-9.-]+", "-", name)   # replace invalid chars, including "_"
+        name = re.sub(r"^[^a-z0-9]+", "", name)     # must start with alnum
+        name = re.sub(r"[^a-z0-9]+$", "", name)     # must end with alnum
+        name = re.sub(r"-{2,}", "-", name)          # collapse repeated dashes
         name = name[:max_length]
-        name = re.sub(r'[^a-z0-9]+$', '', name)     # re-trim after truncation
+        name = re.sub(r"[^a-z0-9]+$", "", name)     # re-trim after truncation
         return name or "job"
 
-    def apply_overrides(self, doc: dict, namespace: str, job_name: str, run_id: str, node_name: Optional[str]=None) -> dict:
+    def apply_overrides(self, doc: dict, namespace: str, job_name: str, node_name: Optional[str]=None) -> dict:
         root_metadata = doc.setdefault("metadata", {})
         root_metadata["name"] = job_name
         root_metadata["namespace"] = namespace
-        root_labels = root_metadata.setdefault("labels", {})
-        root_labels["run_id"] = run_id
 
         template = doc.setdefault("spec", {}).setdefault("template", {})
-        template_labels = template.setdefault("metadata", {}).setdefault("labels", {})
-        template_labels["run_id"] = run_id
 
         pod_spec = template.setdefault("spec", {})
         pod_spec.setdefault("restartPolicy", "Never")
@@ -64,10 +61,15 @@ class WorkloadGenerator:
             pod_spec.setdefault("nodeSelector", {})["kubernetes.io/hostname"] = node_name
         return doc
     
-    def launch_single_job(self, namespace: str, job_name: str, run_id: str, node_name: Optional[str]=None) -> dict:
+    def _build_unique_job_name(self, base_job_name: str, launch_index: int, timestamp: str = None) -> str:
+        if timestamp is None:
+            timestamp = self.now_utc_compact()
+        return f"{base_job_name}-{timestamp}-{launch_index}"[:63].rstrip("-").lower()
+    
+    def launch_single_job(self, namespace: str, job_name: str, node_name: Optional[str]=None) -> dict:
         job_name = self.sanitize_k8s_name(job_name)
         doc = self.load_yaml(self.template_path)
-        doc = self.apply_overrides(doc, namespace, job_name, run_id, node_name)
+        doc = self.apply_overrides(doc, namespace, job_name, node_name)
 
         created = self._batch_api.create_namespaced_job(namespace=namespace, body=doc)
 
@@ -79,12 +81,12 @@ class WorkloadGenerator:
         }
         return payload
     
-    def launch_multiple_jobs(self, namespace: str, job_name: str, run_id: str, n: int, node_name: Optional[str]=None) -> List[dict]:
+    def launch_multiple_jobs(self, namespace: str, job_name: str, n: int, node_name: Optional[str]=None) -> List[dict]:
         results = []
         timestamp = self.now_utc_compact()
         for i in range(n):
-            unique_job_name = f"{job_name}-{timestamp}-{i}"[:63].rstrip("-").lower()
-            result = self.launch_single_job(namespace, unique_job_name, run_id, node_name)
+            unique_job_name = self._build_unique_job_name(job_name, i, timestamp)
+            result = self.launch_single_job(namespace, unique_job_name, node_name)
             results.append(result)
         return results
     
@@ -98,7 +100,7 @@ class WorkloadGenerator:
                 return "failed", condition.last_transition_time
         return None, None
     
-    def _delete_job(self, namespace: str, job_name: str) -> None:
+    def delete_job(self, namespace: str, job_name: str) -> None:
         body = client.V1DeleteOptions(propagation_policy="Background")
         try:
             self._batch_api.delete_namespaced_job(
@@ -113,60 +115,6 @@ class WorkloadGenerator:
                 return
             raise
 
-    def wait_for_jobs_and_cleanup(
-        self,
-        launched_jobs: List[dict],
-        delete_after_seconds: int = 300,
-        status_poll_seconds: int = 10,
-    ) -> List[dict]:
-        tracked_jobs = {
-            (job["namespace"], job["job_name"]): dict(job) for job in launched_jobs
-        }
-        remaining_jobs = set(tracked_jobs.keys())
-
-        while remaining_jobs:
-            now = self.now_utc()
-
-            for namespace, job_name in list(remaining_jobs):
-                job_info = tracked_jobs[(namespace, job_name)]
-                try:
-                    current_job = self._batch_api.read_namespaced_job(name=job_name, namespace=namespace)
-                except ApiException as e:
-                    if e.status == 404:
-                        logger.debug(f"Job {namespace}/{job_name} not found (might have been deleted)")
-                        remaining_jobs.remove((namespace, job_name))
-                        job_info.setdefault("terminal_state", "deleted")
-                        continue
-                    else:
-                        logger.error(f"Error fetching job {namespace}/{job_name}: {e}")
-                        raise
-                
-                if job_info.get("terminal_state") is None:
-                    terminal_state, completed_at = self._get_job_terminal_state(current_job)
-                    if terminal_state:
-                        delete_at = (completed_at or now) + timedelta(seconds=delete_after_seconds)
-                        job_info["terminal_state"] = terminal_state
-                        job_info["finished_at"] = completed_at.isoformat() if completed_at else None
-                        job_info["to_be_deleted_at"] = delete_at.isoformat()
-                        logger.debug(
-                            f"Job {namespace}/{job_name} reached terminal state: {terminal_state}."
-                            f" It will be deleted at {delete_at.isoformat()}."
-                        )
-                
-                to_delete_at_str = job_info.get("to_be_deleted_at")
-                if to_delete_at_str:
-                    delete_at = datetime.fromisoformat(to_delete_at_str)
-                    if now >= delete_at:
-                        self._delete_job(namespace, job_name)
-                        job_info.setdefault("terminal_state", "deleted")
-                        job_info["deleted_at"] = now.isoformat()
-                        remaining_jobs.remove((namespace, job_name))
-            
-            if remaining_jobs:
-                logger.info(f"Still tracking {len(remaining_jobs)} job(s). Polling again in {status_poll_seconds} seconds...")
-                time.sleep(status_poll_seconds)
-        return list(tracked_jobs.values())
-    
     def _check_and_delete_jobs(
         self,
         tracked_jobs: Dict[Tuple[str, str], dict],
@@ -185,9 +133,8 @@ class WorkloadGenerator:
                     remaining_jobs.remove((namespace, job_name))
                     job_info.setdefault("terminal_state", "deleted")
                     continue
-                else:
-                    logger.error(f"Error fetching job {namespace}/{job_name}: {e}")
-                    raise
+                logger.error(f"Error fetching job {namespace}/{job_name}: {e}")
+                raise
             
             # Check if the job has reached a terminal state and update tracking info if we haven't already recorded it
             if job_info.get("terminal_state") is None:
@@ -207,7 +154,7 @@ class WorkloadGenerator:
             if to_delete_at_str:
                 delete_at = datetime.fromisoformat(to_delete_at_str)
                 if now >= delete_at:
-                    self._delete_job(namespace, job_name)
+                    self.delete_job(namespace, job_name)
                     job_info.setdefault("terminal_state", "deleted")
                     job_info["deleted_at"] = now.isoformat()
                     remaining_jobs.remove((namespace, job_name))
@@ -238,18 +185,41 @@ class WorkloadGenerator:
             logger.info(f"Still tracking {len(remaining_jobs)} job(s). Waiting {int(remaining_wait_seconds)} more second(s) before the next action...")
             time.sleep(sleep_seconds)
 
-    def run(self, namespace: str, job_name: str, run_id: str, total_jobs: int, batch_size: int, wait_seconds: int, delete_after_seconds: int, status_poll_seconds: int) -> List[dict]:
+    def _track_launched_jobs(self, launched_jobs: List[dict], tracked_jobs: Dict[Tuple[str, str], dict], remaining_jobs: Set[Tuple[str, str]]) -> None:
+        for job in launched_jobs:
+            job_key = (job["namespace"], job["job_name"])
+            tracked_jobs[job_key] = job
+            remaining_jobs.add(job_key)
+
+    def _drain_remaining_jobs(
+        self,
+        tracked_jobs: Dict[Tuple[str, str], dict],
+        remaining_jobs: Set[Tuple[str, str]],
+        total_jobs: int,
+        delete_after_seconds: int,
+        status_poll_seconds: int,
+    ) -> List[dict]:
+        logger.info(f"All {total_jobs} jobs launched. Continuing cleanup until all tracked jobs are deleted...")
+        while remaining_jobs:
+            self._check_and_delete_jobs(
+                tracked_jobs=tracked_jobs,
+                remaining_jobs=remaining_jobs,
+                delete_after_seconds=delete_after_seconds,
+            )
+            if remaining_jobs:
+                logger.info(f"Still tracking {len(remaining_jobs)} job(s). Polling again in {status_poll_seconds} seconds...")
+                time.sleep(status_poll_seconds)
+        return list(tracked_jobs.values())
+
+    def run_batch(self, namespace: str, job_name: str, total_jobs: int, batch_size: int, wait_seconds: int, delete_after_seconds: int, status_poll_seconds: int) -> List[dict]:
         tracked_jobs: Dict[Tuple[str, str], dict] = {}
         remaining_jobs: Set[Tuple[str, str]] = set()
         launched_count = 0
 
         while launched_count < total_jobs:
             current_batch_size = min(batch_size, total_jobs - launched_count)
-            batch_jobs = self.launch_multiple_jobs(namespace, job_name, run_id, current_batch_size)
-            for job in batch_jobs:
-                job_key = (job["namespace"], job["job_name"])
-                tracked_jobs[job_key] = job
-                remaining_jobs.add(job_key)
+            batch_jobs = self.launch_multiple_jobs(namespace, job_name, current_batch_size)
+            self._track_launched_jobs(batch_jobs, tracked_jobs, remaining_jobs)
             launched_count += current_batch_size
 
             # After launching each batch, check the status of all tracked jobs and
@@ -269,14 +239,41 @@ class WorkloadGenerator:
                     delete_after_seconds=delete_after_seconds,
                     status_poll_seconds=status_poll_seconds,
                 )
-        logger.info(f"All {total_jobs} jobs launched. Continuing cleanup until all tracked jobs are deleted...")
-        while remaining_jobs:
+        
+        return self._drain_remaining_jobs(
+            tracked_jobs=tracked_jobs,
+            remaining_jobs=remaining_jobs,
+            total_jobs=total_jobs,
+            delete_after_seconds=delete_after_seconds,
+            status_poll_seconds=status_poll_seconds,
+        )
+
+    def run_poisson(self, namespace: str, job_name: str, total_jobs: int, iat_seconds: float, delete_after_seconds: int, status_poll_seconds: int) -> List[dict]:
+        tracked_jobs: Dict[Tuple[str, str], dict] = {}
+        remaining_jobs: Set[Tuple[str, str]] = set()
+
+        for launched_count in range(total_jobs):
+            unique_job_name = self._build_unique_job_name(job_name, launched_count)
+            launched_job = self.launch_single_job(namespace, unique_job_name)
+            self._track_launched_jobs([launched_job], tracked_jobs, remaining_jobs)
+
             self._check_and_delete_jobs(
                 tracked_jobs=tracked_jobs,
                 remaining_jobs=remaining_jobs,
                 delete_after_seconds=delete_after_seconds,
             )
-            if remaining_jobs:
-                logger.info(f"Still tracking {len(remaining_jobs)} job(s). Polling again in {status_poll_seconds} seconds...")
-                time.sleep(status_poll_seconds)
-        return list(tracked_jobs.values())
+
+            if launched_count + 1 < total_jobs:
+                sampled_wait_seconds = random.expovariate(1.0 / iat_seconds)
+                logger.info(
+                    f"Launched {launched_count + 1}/{total_jobs} jobs. Waiting {sampled_wait_seconds:.2f} seconds before the next Poisson arrival (mean IAT={iat_seconds:.2f}s)..."
+                )
+                self._wait_with_cleanup(
+                    tracked_jobs=tracked_jobs,
+                    remaining_jobs=remaining_jobs,
+                    wait_seconds=sampled_wait_seconds,
+                    delete_after_seconds=delete_after_seconds,
+                    status_poll_seconds=status_poll_seconds,
+                )
+
+        return self._drain_remaining_jobs(tracked_jobs, remaining_jobs, total_jobs, delete_after_seconds, status_poll_seconds)

@@ -5,14 +5,12 @@ metadata:
   namespace: default
   labels:
     app: fibonacci-benchmark
-    run_id: PLACEHOLDER_RUN_ID
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
         app: fibonacci-benchmark
-        run_id: PLACEHOLDER_RUN_ID
     spec:
       restartPolicy: Never
       containers:
