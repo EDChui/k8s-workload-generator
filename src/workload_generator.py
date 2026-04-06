@@ -248,9 +248,10 @@ class WorkloadGenerator:
             status_poll_seconds=status_poll_seconds,
         )
 
-    def run_poisson(self, namespace: str, job_name: str, total_jobs: int, iat_seconds: float, delete_after_seconds: int, status_poll_seconds: int) -> List[dict]:
+    def run_poisson(self, namespace: str, job_name: str, total_jobs: int, iat_seconds: float, delete_after_seconds: int, status_poll_seconds: int, seed: int = None) -> List[dict]:
         tracked_jobs: Dict[Tuple[str, str], dict] = {}
         remaining_jobs: Set[Tuple[str, str]] = set()
+        rng = random.Random(seed)
 
         for launched_count in range(total_jobs):
             unique_job_name = self._build_unique_job_name(job_name, launched_count)
@@ -264,7 +265,7 @@ class WorkloadGenerator:
             )
 
             if launched_count + 1 < total_jobs:
-                sampled_wait_seconds = random.expovariate(1.0 / iat_seconds)
+                sampled_wait_seconds = rng.expovariate(1.0 / iat_seconds)
                 logger.info(
                     f"Launched {launched_count + 1}/{total_jobs} jobs. Waiting {sampled_wait_seconds:.2f} seconds before the next Poisson arrival (mean IAT={iat_seconds:.2f}s)..."
                 )

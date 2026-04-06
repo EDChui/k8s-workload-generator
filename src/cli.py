@@ -1,5 +1,6 @@
 import click
 from pathlib import Path
+from typing import Optional
 
 from workload_generator import WorkloadGenerator
 
@@ -46,6 +47,7 @@ def batch(
 @click.option("--iat-seconds", default=30, required=True, type=int, help="Mean inter-arrival time in seconds for the Poisson process")
 @click.option("--delete-after-seconds", default=300, required=True, type=click.IntRange(min=0), help="Seconds to keep a completed Job before deleting it")
 @click.option("--status-poll-seconds", default=10, required=True, type=click.IntRange(min=1), help="Seconds between Kubernetes status polls while waiting for completion and cleanup")
+@click.option("--seed", default=None, type=int, help="Random seed for reproducibility of the Poisson process (optional)")
 def poisson(
     template: str,
     namespace: str,
@@ -54,6 +56,7 @@ def poisson(
     iat_seconds: int,
     delete_after_seconds: int,
     status_poll_seconds: int,
+    seed: Optional[int] = None,
 ) -> int:
     generator = WorkloadGenerator(Path(template))
     generator.run_poisson(
@@ -63,6 +66,7 @@ def poisson(
         iat_seconds=iat_seconds,
         delete_after_seconds=delete_after_seconds,
         status_poll_seconds=status_poll_seconds,
+        seed=seed,
     )
     return 0
 
