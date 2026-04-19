@@ -1,5 +1,10 @@
 # K8S Workload Generator
 
+Simple Kubernetes workload generator that:
+
+- Creates a batch of jobs with a specified template and parameters.
+- Creates jobs following a Poisson process with specified inter-arrival times.
+
 # Softwares
 
 - Python 3.8.10
