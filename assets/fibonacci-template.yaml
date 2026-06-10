@@ -19,7 +19,7 @@ spec:
           command: ["python", "-u", "-c"]
           args:
             - |
-              import sys
+              import os
               import time
 
               def fib(n):
@@ -27,15 +27,11 @@ spec:
                       return n
                   return fib(n-1) + fib(n-2)
 
-              # 37 = 30 seconds
-              # 40 = 120 seconds
-              # 42 = 300 seconds
+              FIB_N = int(os.environ.get("FIB_N", "42"))
 
-              MAX_N = 42
+              print(f"Starting slow Fibonacci calculation up to {FIB_N}", flush=True)
 
-              print(f"Starting slow Fibonacci calculation up to {MAX_N}", flush=True)
-
-              for i in range(MAX_N + 1):
+              for i in range(FIB_N + 1):
                   start = time.time()
                   result = fib(i)
                   elapsed = time.time() - start

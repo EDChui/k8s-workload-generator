@@ -1,0 +1,31 @@
+# Generator settings for Poisson workload generation.
+# The template path may be absolute or relative to this config file.
+template: fibonacci-template.yaml
+namespace: exp
+job_name: demo
+
+# The same seed reproduces both the Poisson inter-arrival times and the
+# per-job Fibonacci N sequence.
+seed: 42
+
+# Completed Jobs are retained for this many seconds before deletion.
+delete_after_seconds: 300
+status_poll_seconds: 10
+
+# Each job receives a random FIB_N sampled uniformly from [min_N, max_N].
+min_N: 37
+max_N: 42
+
+# Each stage launches 'amount' jobs. Inter-arrival times within the stage are
+# sampled from an exponential distribution with mean 'iat_seconds'.
+workloads:
+  - amount: 100
+    iat_seconds: 60
+  - amount: 200
+    iat_seconds: 30
+  - amount: 200
+    iat_seconds: 15
+  - amount: 200
+    iat_seconds: 30
+  - amount: 100
+    iat_seconds: 60
