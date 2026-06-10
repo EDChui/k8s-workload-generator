@@ -42,7 +42,7 @@ python3 src/cli.py poisson \
 The `poisson` command can also read a config YAML file, following the staged workload style used by `k8s-spark-workload-generator`:
 
 ```bash
-python3 src/cli.py poisson --generator-config assets/generator_config.yaml
+python3 src/cli.py poisson --generator-config assets/generator-config.yaml
 ```
 
 Example config:
