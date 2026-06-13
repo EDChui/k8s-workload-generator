@@ -28,7 +28,7 @@ spec:
 
               IDLE = int(os.environ.get("IDLE_SECONDS", "0"))
               WARMUP = int(os.environ.get("WARMUP_SECONDS", "60"))
-              DURATION = int(os.environ.get("DURATION_SECONDS", "900"))
+              DURATION = int(os.environ.get("DURATION_SECONDS", "300"))
               COOLDOWN = int(os.environ.get("COOLDOWN_SECONDS", "0"))
               SEED = int(os.environ.get("WORKLOAD_SEED", "42"))
 
@@ -52,7 +52,7 @@ spec:
 
               print(
                   f"Starting CPU burn workload with seed={SEED}, "
-                  f"idle={IDLE}s, warmup={WARMUP}s, duration={DURATION}s, cooldown={COOLDOWN}s",
+                  f"idle={IDLE}s, warmup={WARMUP}s, selected_duration={DURATION}s, cooldown={COOLDOWN}s",
                   flush=True,
               )
 
@@ -78,7 +78,7 @@ spec:
             - name: WARMUP_SECONDS
               value: "60"
             - name: DURATION_SECONDS
-              value: "900"
+              value: "300"
             - name: COOLDOWN_SECONDS
               value: "0"
             - name: WORKLOAD_SEED

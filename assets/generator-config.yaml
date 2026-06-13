@@ -4,8 +4,8 @@ template: cpu-burn-template.yaml
 namespace: default
 job_name: demo
 
-# Fixed seed. The same seed reproduces the Poisson inter-arrival sequence and
-# the initial state used by each CPU-burn job.
+# Fixed seed. The same seed reproduces the Poisson inter-arrival sequence,
+# per-job selected durations, and the initial state used by each CPU-burn job.
 seed: 42
 
 # Completed Jobs are retained for this many seconds before deletion.
@@ -13,11 +13,14 @@ delete_after_seconds: 60
 status_poll_seconds: 10
 
 # Per-job CPU-burn shape: idle -> warm-up -> steady CPU burn -> cooldown.
-# These values are passed to the Job as IDLE_SECONDS, WARMUP_SECONDS,
+# Each job gets a reproducibly sampled steady CPU-burn duration in the
+# inclusive range [min_duration_seconds, max_duration_seconds]. These
+# values are passed to the Job as IDLE_SECONDS, WARMUP_SECONDS,
 # DURATION_SECONDS, and COOLDOWN_SECONDS.
 idle_seconds: 0
 warmup_seconds: 60
-duration_seconds: 900
+min_duration_seconds: 300
+max_duration_seconds: 600
 cooldown_seconds: 0
 
 # Each stage launches 'amount' jobs. Inter-arrival times within the stage are

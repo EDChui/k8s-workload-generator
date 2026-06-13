@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_SEED = 42
 DEFAULT_IDLE_SECONDS = 0
 DEFAULT_WARMUP_SECONDS = 60
-DEFAULT_DURATION_SECONDS = 900
+DEFAULT_MIN_DURATION_SECONDS = 300
+DEFAULT_MAX_DURATION_SECONDS = 600
 DEFAULT_COOLDOWN_SECONDS = 0
 
 
@@ -41,7 +42,8 @@ class GeneratorConfig:
     status_poll_seconds: int
     idle_seconds: int
     warmup_seconds: int
-    duration_seconds: int
+    min_duration_seconds: int
+    max_duration_seconds: int
     cooldown_seconds: int
     workloads: List[WorkloadStage]
 
@@ -56,6 +58,13 @@ def _get_int(config_data: dict, key: str, default: int) -> int:
 def _validate_non_negative_seconds(name: str, value: int) -> None:
     if value < 0:
         raise ValueError(f"{name} must be a non-negative integer number of seconds")
+
+
+def _validate_duration_range(min_duration_seconds: int, max_duration_seconds: int) -> None:
+    _validate_non_negative_seconds("min_duration_seconds", min_duration_seconds)
+    _validate_non_negative_seconds("max_duration_seconds", max_duration_seconds)
+    if min_duration_seconds > max_duration_seconds:
+        raise ValueError("min_duration_seconds must be less than or equal to max_duration_seconds")
 
 
 def load_generator_config(config_path: Path) -> GeneratorConfig:
@@ -80,15 +89,22 @@ def load_generator_config(config_path: Path) -> GeneratorConfig:
 
     idle_seconds = _get_int(config_data, "idle_seconds", DEFAULT_IDLE_SECONDS)
     warmup_seconds = _get_int(config_data, "warmup_seconds", DEFAULT_WARMUP_SECONDS)
-    duration_seconds = _get_int(config_data, "duration_seconds", DEFAULT_DURATION_SECONDS)
+    if "duration_seconds" in config_data and "min_duration_seconds" not in config_data and "max_duration_seconds" not in config_data:
+        # Backward-compatible fixed-duration config: min == max == duration_seconds.
+        fixed_duration_seconds = _get_int(config_data, "duration_seconds", DEFAULT_MAX_DURATION_SECONDS)
+        min_duration_seconds = fixed_duration_seconds
+        max_duration_seconds = fixed_duration_seconds
+    else:
+        min_duration_seconds = _get_int(config_data, "min_duration_seconds", DEFAULT_MIN_DURATION_SECONDS)
+        max_duration_seconds = _get_int(config_data, "max_duration_seconds", DEFAULT_MAX_DURATION_SECONDS)
     cooldown_seconds = _get_int(config_data, "cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)
     for name, value in (
         ("idle_seconds", idle_seconds),
         ("warmup_seconds", warmup_seconds),
-        ("duration_seconds", duration_seconds),
         ("cooldown_seconds", cooldown_seconds),
     ):
         _validate_non_negative_seconds(name, value)
+    _validate_duration_range(min_duration_seconds, max_duration_seconds)
 
     return GeneratorConfig(
         template=config_data.get("template", "assets/cpu-burn-template.yaml"),
@@ -99,7 +115,8 @@ def load_generator_config(config_path: Path) -> GeneratorConfig:
         status_poll_seconds=_get_int(config_data, "status_poll_seconds", 10),
         idle_seconds=idle_seconds,
         warmup_seconds=warmup_seconds,
-        duration_seconds=duration_seconds,
+        min_duration_seconds=min_duration_seconds,
+        max_duration_seconds=max_duration_seconds,
         cooldown_seconds=cooldown_seconds,
         workloads=workloads,
     )
@@ -151,6 +168,11 @@ class WorkloadGenerator:
             _validate_non_negative_seconds(name, value)
 
     @staticmethod
+    def _sample_duration_seconds(rng: random.Random, min_duration_seconds: int, max_duration_seconds: int) -> int:
+        _validate_duration_range(min_duration_seconds, max_duration_seconds)
+        return rng.randint(min_duration_seconds, max_duration_seconds)
+
+    @staticmethod
     def _upsert_env(container: dict, name: str, value: str) -> None:
         env = container.setdefault("env", [])
         for entry in env:
@@ -167,7 +189,7 @@ class WorkloadGenerator:
         node_name: Optional[str] = None,
         idle_seconds: int = DEFAULT_IDLE_SECONDS,
         warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
-        duration_seconds: int = DEFAULT_DURATION_SECONDS,
+        duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
         seed: int = DEFAULT_SEED,
     ) -> dict:
@@ -218,7 +240,7 @@ class WorkloadGenerator:
         node_name: Optional[str] = None,
         idle_seconds: int = DEFAULT_IDLE_SECONDS,
         warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
-        duration_seconds: int = DEFAULT_DURATION_SECONDS,
+        duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
         seed: int = DEFAULT_SEED,
     ) -> dict:
@@ -259,13 +281,22 @@ class WorkloadGenerator:
         node_name: Optional[str] = None,
         idle_seconds: int = DEFAULT_IDLE_SECONDS,
         warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
-        duration_seconds: int = DEFAULT_DURATION_SECONDS,
+        min_duration_seconds: int = DEFAULT_MIN_DURATION_SECONDS,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
         seed: int = DEFAULT_SEED,
+        duration_rng: Optional[random.Random] = None,
     ) -> List[dict]:
+        _validate_duration_range(min_duration_seconds, max_duration_seconds)
         results = []
         timestamp = self.now_utc_compact()
+        rng = duration_rng or random.Random(seed)
         for i in range(n):
+            selected_duration_seconds = self._sample_duration_seconds(
+                rng,
+                min_duration_seconds=min_duration_seconds,
+                max_duration_seconds=max_duration_seconds,
+            )
             unique_job_name = self._build_unique_job_name(job_name, i, timestamp)
             result = self.launch_single_job(
                 namespace=namespace,
@@ -273,7 +304,7 @@ class WorkloadGenerator:
                 node_name=node_name,
                 idle_seconds=idle_seconds,
                 warmup_seconds=warmup_seconds,
-                duration_seconds=duration_seconds,
+                duration_seconds=selected_duration_seconds,
                 cooldown_seconds=cooldown_seconds,
                 seed=seed,
             )
@@ -414,13 +445,16 @@ class WorkloadGenerator:
         seed: int = DEFAULT_SEED,
         idle_seconds: int = DEFAULT_IDLE_SECONDS,
         warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
-        duration_seconds: int = DEFAULT_DURATION_SECONDS,
+        min_duration_seconds: int = DEFAULT_MIN_DURATION_SECONDS,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     ) -> List[dict]:
         tracked_jobs: Dict[Tuple[str, str], dict] = {}
         remaining_jobs: Set[Tuple[str, str]] = set()
         launched_count = 0
-        self._validate_phase_seconds(idle_seconds, warmup_seconds, duration_seconds, cooldown_seconds)
+        self._validate_phase_seconds(idle_seconds, warmup_seconds, min_duration_seconds, cooldown_seconds)
+        _validate_duration_range(min_duration_seconds, max_duration_seconds)
+        duration_rng = random.Random(seed)
 
         while launched_count < total_jobs:
             current_batch_size = min(batch_size, total_jobs - launched_count)
@@ -430,9 +464,11 @@ class WorkloadGenerator:
                 n=current_batch_size,
                 idle_seconds=idle_seconds,
                 warmup_seconds=warmup_seconds,
-                duration_seconds=duration_seconds,
+                min_duration_seconds=min_duration_seconds,
+                max_duration_seconds=max_duration_seconds,
                 cooldown_seconds=cooldown_seconds,
                 seed=seed,
+                duration_rng=duration_rng,
             )
             self._track_launched_jobs(batch_jobs, tracked_jobs, remaining_jobs)
             launched_count += current_batch_size
@@ -473,15 +509,18 @@ class WorkloadGenerator:
         seed: int = DEFAULT_SEED,
         idle_seconds: int = DEFAULT_IDLE_SECONDS,
         warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
-        duration_seconds: int = DEFAULT_DURATION_SECONDS,
+        min_duration_seconds: int = DEFAULT_MIN_DURATION_SECONDS,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     ) -> List[dict]:
         tracked_jobs: Dict[Tuple[str, str], dict] = {}
         remaining_jobs: Set[Tuple[str, str]] = set()
-        rng = random.Random(seed)
+        arrival_rng = random.Random(seed)
+        duration_rng = random.Random(seed)
         total_jobs = sum(stage.amount for stage in workloads)
         total_launch_count = 0
-        self._validate_phase_seconds(idle_seconds, warmup_seconds, duration_seconds, cooldown_seconds)
+        self._validate_phase_seconds(idle_seconds, warmup_seconds, min_duration_seconds, cooldown_seconds)
+        _validate_duration_range(min_duration_seconds, max_duration_seconds)
 
         for stage_idx, stage in enumerate(workloads):
             logger.info(
@@ -489,13 +528,18 @@ class WorkloadGenerator:
                 f"{stage.amount} jobs with mean IAT {stage.iat_seconds:.2f} seconds"
             )
             for launch_idx in range(stage.amount):
+                selected_duration_seconds = self._sample_duration_seconds(
+                    duration_rng,
+                    min_duration_seconds=min_duration_seconds,
+                    max_duration_seconds=max_duration_seconds,
+                )
                 unique_job_name = self._build_unique_job_name(job_name, total_launch_count)
                 launched_job = self.launch_single_job(
                     namespace=namespace,
                     job_name=unique_job_name,
                     idle_seconds=idle_seconds,
                     warmup_seconds=warmup_seconds,
-                    duration_seconds=duration_seconds,
+                    duration_seconds=selected_duration_seconds,
                     cooldown_seconds=cooldown_seconds,
                     seed=seed,
                 )
@@ -506,7 +550,9 @@ class WorkloadGenerator:
                     f"Launched {launch_idx + 1}/{stage.amount} of stage {stage_idx + 1} "
                     f"({total_launch_count}/{total_jobs} total) with CPU burn "
                     f"idle={idle_seconds}s warmup={warmup_seconds}s "
-                    f"duration={duration_seconds}s cooldown={cooldown_seconds}s seed={seed}"
+                    f"duration={selected_duration_seconds}s "
+                    f"range=[{min_duration_seconds},{max_duration_seconds}]s "
+                    f"cooldown={cooldown_seconds}s seed={seed}"
                 )
 
                 self._check_and_delete_jobs(
@@ -516,7 +562,7 @@ class WorkloadGenerator:
                 )
 
                 if launch_idx < stage.amount - 1:
-                    sampled_wait_seconds = rng.expovariate(1.0 / stage.iat_seconds)
+                    sampled_wait_seconds = arrival_rng.expovariate(1.0 / stage.iat_seconds)
                     logger.info(
                         f"Waiting {sampled_wait_seconds:.2f} seconds before the next Poisson arrival "
                         f"(stage mean IAT={stage.iat_seconds:.2f}s)..."
@@ -548,7 +594,8 @@ class WorkloadGenerator:
         seed: int = DEFAULT_SEED,
         idle_seconds: int = DEFAULT_IDLE_SECONDS,
         warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
-        duration_seconds: int = DEFAULT_DURATION_SECONDS,
+        min_duration_seconds: int = DEFAULT_MIN_DURATION_SECONDS,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     ) -> List[dict]:
         workload = WorkloadStage(amount=total_jobs, iat_seconds=iat_seconds)
@@ -561,7 +608,8 @@ class WorkloadGenerator:
             seed=seed,
             idle_seconds=idle_seconds,
             warmup_seconds=warmup_seconds,
-            duration_seconds=duration_seconds,
+            min_duration_seconds=min_duration_seconds,
+            max_duration_seconds=max_duration_seconds,
             cooldown_seconds=cooldown_seconds,
         )
 
@@ -575,6 +623,7 @@ class WorkloadGenerator:
             seed=generator_config.seed,
             idle_seconds=generator_config.idle_seconds,
             warmup_seconds=generator_config.warmup_seconds,
-            duration_seconds=generator_config.duration_seconds,
+            min_duration_seconds=generator_config.min_duration_seconds,
+            max_duration_seconds=generator_config.max_duration_seconds,
             cooldown_seconds=generator_config.cooldown_seconds,
         )
