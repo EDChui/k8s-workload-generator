@@ -21,18 +21,18 @@ idle_seconds: 0
 warmup_seconds: 60
 min_duration_seconds: 300
 max_duration_seconds: 600
-cooldown_seconds: 0
+cooldown_seconds: 60
 
 # Each stage launches 'amount' jobs. Inter-arrival times within the stage are
 # sampled from an exponential distribution with mean 'iat_seconds'.
 workloads:
-  - amount: 100
-    iat_seconds: 60
-  - amount: 200
-    iat_seconds: 30
-  - amount: 200
-    iat_seconds: 15
-  - amount: 200
-    iat_seconds: 30
-  - amount: 100
-    iat_seconds: 60
+  - amount: 25
+    iat_seconds: 28 # low
+  - amount: 80
+    iat_seconds: 20 # medium
+  - amount: 160
+    iat_seconds: 10.5 # high
+  - amount: 80
+    iat_seconds: 20 # medium
+  - amount: 25
+    iat_seconds: 28 # low
