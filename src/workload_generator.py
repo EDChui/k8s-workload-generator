@@ -18,6 +18,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DEFAULT_SEED = 42
+DEFAULT_IDLE_SECONDS = 0
+DEFAULT_WARMUP_SECONDS = 60
+DEFAULT_MIN_DURATION_SECONDS = 300
+DEFAULT_MAX_DURATION_SECONDS = 600
+DEFAULT_COOLDOWN_SECONDS = 0
+
 
 @dataclass
 class WorkloadStage:
@@ -30,11 +37,14 @@ class GeneratorConfig:
     template: str
     namespace: str
     job_name: str
-    seed: Optional[int]
+    seed: int
     delete_after_seconds: int
     status_poll_seconds: int
-    min_N: int
-    max_N: int
+    idle_seconds: int
+    warmup_seconds: int
+    min_duration_seconds: int
+    max_duration_seconds: int
+    cooldown_seconds: int
     workloads: List[WorkloadStage]
 
 
@@ -43,6 +53,18 @@ def _get_int(config_data: dict, key: str, default: int) -> int:
     if not isinstance(value, int):
         raise ValueError(f"Generator config key {key} must be an integer")
     return value
+
+
+def _validate_non_negative_seconds(name: str, value: int) -> None:
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer number of seconds")
+
+
+def _validate_duration_range(min_duration_seconds: int, max_duration_seconds: int) -> None:
+    _validate_non_negative_seconds("min_duration_seconds", min_duration_seconds)
+    _validate_non_negative_seconds("max_duration_seconds", max_duration_seconds)
+    if min_duration_seconds > max_duration_seconds:
+        raise ValueError("min_duration_seconds must be less than or equal to max_duration_seconds")
 
 
 def load_generator_config(config_path: Path) -> GeneratorConfig:
@@ -65,22 +87,37 @@ def load_generator_config(config_path: Path) -> GeneratorConfig:
             raise ValueError(f"workloads[{idx}].iat_seconds must be a positive number")
         workloads.append(WorkloadStage(amount=amount, iat_seconds=float(iat_seconds)))
 
-    min_N = _get_int(config_data, "min_N", 42)
-    max_N = _get_int(config_data, "max_N", 42)
-    if min_N < 0 or max_N < 0:
-        raise ValueError("min_N and max_N must be non-negative integers")
-    if min_N > max_N:
-        raise ValueError("min_N must be less than or equal to max_N")
+    idle_seconds = _get_int(config_data, "idle_seconds", DEFAULT_IDLE_SECONDS)
+    warmup_seconds = _get_int(config_data, "warmup_seconds", DEFAULT_WARMUP_SECONDS)
+    if "duration_seconds" in config_data and "min_duration_seconds" not in config_data and "max_duration_seconds" not in config_data:
+        # Backward-compatible fixed-duration config: min == max == duration_seconds.
+        fixed_duration_seconds = _get_int(config_data, "duration_seconds", DEFAULT_MAX_DURATION_SECONDS)
+        min_duration_seconds = fixed_duration_seconds
+        max_duration_seconds = fixed_duration_seconds
+    else:
+        min_duration_seconds = _get_int(config_data, "min_duration_seconds", DEFAULT_MIN_DURATION_SECONDS)
+        max_duration_seconds = _get_int(config_data, "max_duration_seconds", DEFAULT_MAX_DURATION_SECONDS)
+    cooldown_seconds = _get_int(config_data, "cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)
+    for name, value in (
+        ("idle_seconds", idle_seconds),
+        ("warmup_seconds", warmup_seconds),
+        ("cooldown_seconds", cooldown_seconds),
+    ):
+        _validate_non_negative_seconds(name, value)
+    _validate_duration_range(min_duration_seconds, max_duration_seconds)
 
     return GeneratorConfig(
-        template=config_data.get("template", "assets/fibonacci-template.yaml"),
+        template=config_data.get("template", "assets/cpu-burn-template.yaml"),
         namespace=config_data.get("namespace", "default"),
         job_name=config_data.get("job_name", "demo"),
-        seed=config_data.get("seed"),
+        seed=_get_int(config_data, "seed", DEFAULT_SEED),
         delete_after_seconds=_get_int(config_data, "delete_after_seconds", 300),
         status_poll_seconds=_get_int(config_data, "status_poll_seconds", 10),
-        min_N=min_N,
-        max_N=max_N,
+        idle_seconds=idle_seconds,
+        warmup_seconds=warmup_seconds,
+        min_duration_seconds=min_duration_seconds,
+        max_duration_seconds=max_duration_seconds,
+        cooldown_seconds=cooldown_seconds,
         workloads=workloads,
     )
 
@@ -116,16 +153,24 @@ class WorkloadGenerator:
         return name or "job"
 
     @staticmethod
-    def _validate_fibonacci_range(min_N: int, max_N: int) -> None:
-        if min_N < 0 or max_N < 0:
-            raise ValueError("min_N and max_N must be non-negative integers")
-        if min_N > max_N:
-            raise ValueError("min_N must be less than or equal to max_N")
+    def _validate_phase_seconds(
+        idle_seconds: int,
+        warmup_seconds: int,
+        duration_seconds: int,
+        cooldown_seconds: int,
+    ) -> None:
+        for name, value in (
+            ("idle_seconds", idle_seconds),
+            ("warmup_seconds", warmup_seconds),
+            ("duration_seconds", duration_seconds),
+            ("cooldown_seconds", cooldown_seconds),
+        ):
+            _validate_non_negative_seconds(name, value)
 
     @staticmethod
-    def _sample_fibonacci_N(rng: random.Random, min_N: int, max_N: int) -> int:
-        WorkloadGenerator._validate_fibonacci_range(min_N, max_N)
-        return rng.randint(min_N, max_N)
+    def _sample_duration_seconds(rng: random.Random, min_duration_seconds: int, max_duration_seconds: int) -> int:
+        _validate_duration_range(min_duration_seconds, max_duration_seconds)
+        return rng.randint(min_duration_seconds, max_duration_seconds)
 
     @staticmethod
     def _upsert_env(container: dict, name: str, value: str) -> None:
@@ -142,33 +187,44 @@ class WorkloadGenerator:
         namespace: str,
         job_name: str,
         node_name: Optional[str] = None,
-        fib_N: Optional[int] = None,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
+        duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+        seed: int = DEFAULT_SEED,
     ) -> dict:
+        self._validate_phase_seconds(
+            idle_seconds=idle_seconds,
+            warmup_seconds=warmup_seconds,
+            duration_seconds=duration_seconds,
+            cooldown_seconds=cooldown_seconds,
+        )
+
         root_metadata = doc.setdefault("metadata", {})
         root_metadata["name"] = job_name
         root_metadata["namespace"] = namespace
+        root_metadata.setdefault("labels", {})["workload"] = "cpu-burn"
 
         template = doc.setdefault("spec", {}).setdefault("template", {})
         template_metadata = template.setdefault("metadata", {})
-
-        if fib_N is not None:
-            fib_value = str(fib_N)
-            root_metadata.setdefault("labels", {})["fib-n"] = fib_value
-            template_metadata.setdefault("labels", {})["fib-n"] = fib_value
+        template_metadata.setdefault("labels", {})["workload"] = "cpu-burn"
 
         pod_spec = template.setdefault("spec", {})
         pod_spec.setdefault("restartPolicy", "Never")
         if node_name is not None:
             pod_spec.setdefault("nodeSelector", {})["kubernetes.io/hostname"] = node_name
 
-        if fib_N is not None:
-            containers = pod_spec.get("containers") or []
-            if not containers:
-                raise ValueError("Job template must contain at least one container when fib_N is configured")
-            # The bundled Fibonacci template has one container named 'main'. If a custom
-            # template has multiple containers, prefer 'main' and fall back to the first.
-            target_container = next((c for c in containers if c.get("name") == "main"), containers[0])
-            self._upsert_env(target_container, "FIB_N", str(fib_N))
+        containers = pod_spec.get("containers") or []
+        if not containers:
+            raise ValueError("Job template must contain at least one container")
+        # The bundled CPU template has one container named 'main'. If a custom
+        # template has multiple containers, prefer 'main' and fall back to the first.
+        target_container = next((c for c in containers if c.get("name") == "main"), containers[0])
+        self._upsert_env(target_container, "IDLE_SECONDS", str(idle_seconds))
+        self._upsert_env(target_container, "WARMUP_SECONDS", str(warmup_seconds))
+        self._upsert_env(target_container, "DURATION_SECONDS", str(duration_seconds))
+        self._upsert_env(target_container, "COOLDOWN_SECONDS", str(cooldown_seconds))
+        self._upsert_env(target_container, "WORKLOAD_SEED", str(seed))
 
         return doc
 
@@ -182,11 +238,25 @@ class WorkloadGenerator:
         namespace: str,
         job_name: str,
         node_name: Optional[str] = None,
-        fib_N: Optional[int] = None,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
+        duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+        seed: int = DEFAULT_SEED,
     ) -> dict:
         job_name = self.sanitize_k8s_name(job_name)
         doc = self.load_yaml(self.template_path)
-        doc = self.apply_overrides(doc, namespace, job_name, node_name, fib_N)
+        doc = self.apply_overrides(
+            doc=doc,
+            namespace=namespace,
+            job_name=job_name,
+            node_name=node_name,
+            idle_seconds=idle_seconds,
+            warmup_seconds=warmup_seconds,
+            duration_seconds=duration_seconds,
+            cooldown_seconds=cooldown_seconds,
+            seed=seed,
+        )
 
         created = self._batch_api.create_namespaced_job(namespace=namespace, body=doc)
 
@@ -195,9 +265,12 @@ class WorkloadGenerator:
             "job_name": created.metadata.name,
             "uid": created.metadata.uid,
             "created_at": created.metadata.creation_timestamp.isoformat() if created.metadata.creation_timestamp else None,
+            "idle_seconds": idle_seconds,
+            "warmup_seconds": warmup_seconds,
+            "duration_seconds": duration_seconds,
+            "cooldown_seconds": cooldown_seconds,
+            "seed": seed,
         }
-        if fib_N is not None:
-            payload["fib_N"] = fib_N
         return payload
 
     def launch_multiple_jobs(
@@ -206,17 +279,35 @@ class WorkloadGenerator:
         job_name: str,
         n: int,
         node_name: Optional[str] = None,
-        rng: Optional[random.Random] = None,
-        min_N: int = 42,
-        max_N: int = 42,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
+        min_duration_seconds: int = DEFAULT_MIN_DURATION_SECONDS,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+        seed: int = DEFAULT_SEED,
+        duration_rng: Optional[random.Random] = None,
     ) -> List[dict]:
+        _validate_duration_range(min_duration_seconds, max_duration_seconds)
         results = []
         timestamp = self.now_utc_compact()
-        rng = rng or random.Random()
+        rng = duration_rng or random.Random(seed)
         for i in range(n):
-            fib_N = self._sample_fibonacci_N(rng, min_N, max_N)
+            selected_duration_seconds = self._sample_duration_seconds(
+                rng,
+                min_duration_seconds=min_duration_seconds,
+                max_duration_seconds=max_duration_seconds,
+            )
             unique_job_name = self._build_unique_job_name(job_name, i, timestamp)
-            result = self.launch_single_job(namespace, unique_job_name, node_name, fib_N=fib_N)
+            result = self.launch_single_job(
+                namespace=namespace,
+                job_name=unique_job_name,
+                node_name=node_name,
+                idle_seconds=idle_seconds,
+                warmup_seconds=warmup_seconds,
+                duration_seconds=selected_duration_seconds,
+                cooldown_seconds=cooldown_seconds,
+                seed=seed,
+            )
             results.append(result)
         return results
 
@@ -351,25 +442,33 @@ class WorkloadGenerator:
         wait_seconds: int,
         delete_after_seconds: int,
         status_poll_seconds: int,
-        seed: Optional[int] = None,
-        min_N: int = 42,
-        max_N: int = 42,
+        seed: int = DEFAULT_SEED,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
+        min_duration_seconds: int = DEFAULT_MIN_DURATION_SECONDS,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     ) -> List[dict]:
         tracked_jobs: Dict[Tuple[str, str], dict] = {}
         remaining_jobs: Set[Tuple[str, str]] = set()
         launched_count = 0
-        rng = random.Random(seed)
-        self._validate_fibonacci_range(min_N, max_N)
+        self._validate_phase_seconds(idle_seconds, warmup_seconds, min_duration_seconds, cooldown_seconds)
+        _validate_duration_range(min_duration_seconds, max_duration_seconds)
+        duration_rng = random.Random(seed)
 
         while launched_count < total_jobs:
             current_batch_size = min(batch_size, total_jobs - launched_count)
             batch_jobs = self.launch_multiple_jobs(
-                namespace,
-                job_name,
-                current_batch_size,
-                rng=rng,
-                min_N=min_N,
-                max_N=max_N,
+                namespace=namespace,
+                job_name=job_name,
+                n=current_batch_size,
+                idle_seconds=idle_seconds,
+                warmup_seconds=warmup_seconds,
+                min_duration_seconds=min_duration_seconds,
+                max_duration_seconds=max_duration_seconds,
+                cooldown_seconds=cooldown_seconds,
+                seed=seed,
+                duration_rng=duration_rng,
             )
             self._track_launched_jobs(batch_jobs, tracked_jobs, remaining_jobs)
             launched_count += current_batch_size
@@ -407,16 +506,21 @@ class WorkloadGenerator:
         workloads: List[WorkloadStage],
         delete_after_seconds: int,
         status_poll_seconds: int,
-        seed: Optional[int] = None,
-        min_N: int = 42,
-        max_N: int = 42,
+        seed: int = DEFAULT_SEED,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
+        min_duration_seconds: int = DEFAULT_MIN_DURATION_SECONDS,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     ) -> List[dict]:
         tracked_jobs: Dict[Tuple[str, str], dict] = {}
         remaining_jobs: Set[Tuple[str, str]] = set()
-        rng = random.Random(seed)
+        arrival_rng = random.Random(seed)
+        duration_rng = random.Random(seed)
         total_jobs = sum(stage.amount for stage in workloads)
         total_launch_count = 0
-        self._validate_fibonacci_range(min_N, max_N)
+        self._validate_phase_seconds(idle_seconds, warmup_seconds, min_duration_seconds, cooldown_seconds)
+        _validate_duration_range(min_duration_seconds, max_duration_seconds)
 
         for stage_idx, stage in enumerate(workloads):
             logger.info(
@@ -424,15 +528,31 @@ class WorkloadGenerator:
                 f"{stage.amount} jobs with mean IAT {stage.iat_seconds:.2f} seconds"
             )
             for launch_idx in range(stage.amount):
-                fib_N = self._sample_fibonacci_N(rng, min_N, max_N)
+                selected_duration_seconds = self._sample_duration_seconds(
+                    duration_rng,
+                    min_duration_seconds=min_duration_seconds,
+                    max_duration_seconds=max_duration_seconds,
+                )
                 unique_job_name = self._build_unique_job_name(job_name, total_launch_count)
-                launched_job = self.launch_single_job(namespace, unique_job_name, fib_N=fib_N)
+                launched_job = self.launch_single_job(
+                    namespace=namespace,
+                    job_name=unique_job_name,
+                    idle_seconds=idle_seconds,
+                    warmup_seconds=warmup_seconds,
+                    duration_seconds=selected_duration_seconds,
+                    cooldown_seconds=cooldown_seconds,
+                    seed=seed,
+                )
                 self._track_launched_jobs([launched_job], tracked_jobs, remaining_jobs)
                 total_launch_count += 1
 
                 logger.info(
                     f"Launched {launch_idx + 1}/{stage.amount} of stage {stage_idx + 1} "
-                    f"({total_launch_count}/{total_jobs} total) with FIB_N={fib_N}"
+                    f"({total_launch_count}/{total_jobs} total) with CPU burn "
+                    f"idle={idle_seconds}s warmup={warmup_seconds}s "
+                    f"duration={selected_duration_seconds}s "
+                    f"range=[{min_duration_seconds},{max_duration_seconds}]s "
+                    f"cooldown={cooldown_seconds}s seed={seed}"
                 )
 
                 self._check_and_delete_jobs(
@@ -442,7 +562,7 @@ class WorkloadGenerator:
                 )
 
                 if launch_idx < stage.amount - 1:
-                    sampled_wait_seconds = rng.expovariate(1.0 / stage.iat_seconds)
+                    sampled_wait_seconds = arrival_rng.expovariate(1.0 / stage.iat_seconds)
                     logger.info(
                         f"Waiting {sampled_wait_seconds:.2f} seconds before the next Poisson arrival "
                         f"(stage mean IAT={stage.iat_seconds:.2f}s)..."
@@ -471,9 +591,12 @@ class WorkloadGenerator:
         iat_seconds: float,
         delete_after_seconds: int,
         status_poll_seconds: int,
-        seed: Optional[int] = None,
-        min_N: int = 42,
-        max_N: int = 42,
+        seed: int = DEFAULT_SEED,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        warmup_seconds: int = DEFAULT_WARMUP_SECONDS,
+        min_duration_seconds: int = DEFAULT_MIN_DURATION_SECONDS,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     ) -> List[dict]:
         workload = WorkloadStage(amount=total_jobs, iat_seconds=iat_seconds)
         return self.run_poisson_stages(
@@ -483,8 +606,11 @@ class WorkloadGenerator:
             delete_after_seconds=delete_after_seconds,
             status_poll_seconds=status_poll_seconds,
             seed=seed,
-            min_N=min_N,
-            max_N=max_N,
+            idle_seconds=idle_seconds,
+            warmup_seconds=warmup_seconds,
+            min_duration_seconds=min_duration_seconds,
+            max_duration_seconds=max_duration_seconds,
+            cooldown_seconds=cooldown_seconds,
         )
 
     def run_poisson_config(self, generator_config: GeneratorConfig) -> List[dict]:
@@ -495,6 +621,9 @@ class WorkloadGenerator:
             delete_after_seconds=generator_config.delete_after_seconds,
             status_poll_seconds=generator_config.status_poll_seconds,
             seed=generator_config.seed,
-            min_N=generator_config.min_N,
-            max_N=generator_config.max_N,
+            idle_seconds=generator_config.idle_seconds,
+            warmup_seconds=generator_config.warmup_seconds,
+            min_duration_seconds=generator_config.min_duration_seconds,
+            max_duration_seconds=generator_config.max_duration_seconds,
+            cooldown_seconds=generator_config.cooldown_seconds,
         )

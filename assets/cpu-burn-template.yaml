@@ -1,0 +1,92 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: PLACEHOLDER_JOB_NAME
+  namespace: default
+  labels:
+    app: cpu-burn-benchmark
+    workload: cpu-burn
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: cpu-burn-benchmark
+        workload: cpu-burn
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: main
+          image: python:3.11-slim
+          command: ["python", "-u", "-c"]
+          args:
+            - |
+              import math
+              import os
+              import random
+              import time
+
+              IDLE = int(os.environ.get("IDLE_SECONDS", "0"))
+              WARMUP = int(os.environ.get("WARMUP_SECONDS", "60"))
+              DURATION = int(os.environ.get("DURATION_SECONDS", "300"))
+              COOLDOWN = int(os.environ.get("COOLDOWN_SECONDS", "0"))
+              SEED = int(os.environ.get("WORKLOAD_SEED", "42"))
+
+              rng = random.Random(SEED)
+              x = 0.123456789 + rng.random()
+
+              def cpu_step(value):
+                  return math.sin(value) * math.cos(value) + math.sqrt(abs(value) + 1.0)
+
+              def burn_for(seconds, phase, inner_iterations=10000):
+                  global x
+                  end = time.time() + seconds
+                  iterations = 0
+                  print(f"{phase} for {seconds}s", flush=True)
+                  while time.time() < end:
+                      for _ in range(inner_iterations):
+                          x = cpu_step(x)
+                      iterations += inner_iterations
+                  print(f"{phase} complete. iterations={iterations}, x={x}", flush=True)
+                  return iterations
+
+              print(
+                  f"Starting CPU burn workload with seed={SEED}, "
+                  f"idle={IDLE}s, warmup={WARMUP}s, selected_duration={DURATION}s, cooldown={COOLDOWN}s",
+                  flush=True,
+              )
+
+              if IDLE > 0:
+                  print(f"Idle for {IDLE}s", flush=True)
+                  time.sleep(IDLE)
+
+              warmup_iterations = burn_for(WARMUP, "Warmup") if WARMUP > 0 else 0
+              burn_iterations = burn_for(DURATION, "Steady CPU burn") if DURATION > 0 else 0
+
+              if COOLDOWN > 0:
+                  print(f"Cooldown for {COOLDOWN}s", flush=True)
+                  time.sleep(COOLDOWN)
+
+              print(
+                  f"Done. warmup_iterations={warmup_iterations}, "
+                  f"burn_iterations={burn_iterations}, x={x}",
+                  flush=True,
+              )
+          env:
+            - name: IDLE_SECONDS
+              value: "0"
+            - name: WARMUP_SECONDS
+              value: "60"
+            - name: DURATION_SECONDS
+              value: "300"
+            - name: COOLDOWN_SECONDS
+              value: "0"
+            - name: WORKLOAD_SEED
+              value: "42"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
